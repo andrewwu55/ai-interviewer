@@ -5,9 +5,11 @@ import hashlib
 import yaml 
 from typing import Dict, Generator, Tuple 
 import dropbox 
+import dropbox.files 
 import pandas as pd 
+import csv 
 from docx import Document
-from io import BytesIO
+import io 
 from pathlib import Path 
 import threading 
 import logging 
@@ -94,6 +96,9 @@ class StreamlitGUI:
                 self.stream_initial_message()  
             if st.session_state.interview_status and not st.session_state.first_instructions_shown: 
                 st.session_state.first_instructions_shown = True 
+            if not st.session_state.show_login_form: 
+                self.get_past_sessions() 
+            self.display_past_transcripts() 
 
 
     # --------------------------------------------------------------------------
@@ -128,10 +133,10 @@ class StreamlitGUI:
 
         if 'session_id' not in st.session_state and 'username' in st.session_state: 
             # store the start time of the interview 
-            st.session_state.start_time = datetime.now(timezone.utc).timestamp() 
+            start_time = datetime.now(timezone.utc).timestamp() 
 
             # create and store the session ID of the interview 
-            data = f"{st.session_state.username}+{st.session_state.start_time}"
+            data = f"{st.session_state.username}+{start_time}"
             st.session_state.session_id = hashlib.sha256(data.encode()).hexdigest() 
 
         if 'quit_button_hit' not in st.session_state: 
@@ -302,6 +307,20 @@ class StreamlitGUI:
         st.session_state.quit_button_hit = True 
 
 
+    def display_past_transcripts(self) -> None: 
+        if not st.session_state.show_login_form: 
+            session_options = list(st.session_state.past_transcripts_map.keys()) 
+            with st.sidebar: 
+                st.selectbox(
+                    "Click here to continue a previous conversation", 
+                    session_options, 
+                    index=session_options.index(st.session_state.session_id_to_num_map[st.session_state.session_id]), 
+                    key="past_transcripts_select", 
+                    on_change=self.on_chose_past_transcript
+                )
+
+
+
     # --------------------------------------------------------------------------
     # backend 
     # --------------------------------------------------------------------------
@@ -323,7 +342,7 @@ class StreamlitGUI:
         st.session_state.reached_error = False 
 
         # remove any other session variable to start over 
-        for key in ['transcript_history', 'gui_message_history', 'start_time', 'session_id', 'log', 'log_stream']: 
+        for key in ['transcript_history', 'gui_message_history', 'session_id', 'log', 'log_stream', 'past_transcripts_map']: 
             if key in st.session_state:
                 del st.session_state[key]
 
@@ -419,7 +438,7 @@ class StreamlitGUI:
                 doc.add_paragraph(summary)
 
                 # save the document into BytesIO 
-                doc_bytes = BytesIO() 
+                doc_bytes = io.BytesIO() 
                 doc.save(doc_bytes) 
                 doc_bytes.seek(0) 
             except Exception as e: 
@@ -448,7 +467,7 @@ class StreamlitGUI:
         """Function that runs when the restart button is hit"""
         self.log("warning", "Restarting interview", st.session_state.to_dict())
         # reset some session state variables 
-        for key in ['transcript_history', 'gui_message_history', 'start_time', 'session_id', 'quit_button_hit', 'log', 'log_stream']: 
+        for key in ['transcript_history', 'gui_message_history', 'session_id', 'quit_button_hit', 'log', 'log_stream', 'past_transcripts_map']: 
             if key in st.session_state:
                 del st.session_state[key]
         # restart the interview 
@@ -474,6 +493,7 @@ class StreamlitGUI:
             stream (Generator): the generator that contains the messages being streamed 
         """ 
         self.log("warning", "Streaming message", st.session_state.to_dict())
+        streaming_first_msg = not st.session_state.gui_message_history 
         try: 
             with self.chat_container: 
                 # stream messages within the chat container
@@ -511,11 +531,29 @@ class StreamlitGUI:
                     self.save_msg_to_session('assistant', final_msg)
 
                     # save the transcript to dropbox 
-                    thread = threading.Thread(target=self.save_transcript_to_dropbox, args=(st.session_state.to_dict(),)) 
-                    thread.start() 
+                    if not streaming_first_msg: 
+                        thread = threading.Thread(target=self.save_transcript_to_dropbox, args=(st.session_state.to_dict(),)) 
+                        thread.start() 
         except Exception as e: 
             st.session_state.reached_error = True 
             self.log("error", f"Error streaming message from AI: {e}", st.session_state.to_dict())
+
+
+    def on_chose_past_transcript(self) -> None: 
+        session = st.session_state.past_transcripts_select 
+        st.session_state.gui_message_history = st.session_state.past_transcripts_map[session]['gui_message_history']
+        st.session_state.transcript_history = st.session_state.past_transcripts_map[session]['transcript_history'] 
+        if session == "New Session": 
+            # store the start time of the interview 
+            start_time = datetime.now(timezone.utc).timestamp() 
+
+            # create and store the session ID of the interview 
+            data = f"{st.session_state.username}+{start_time}"
+            st.session_state.session_id = hashlib.sha256(data.encode()).hexdigest() 
+        else: 
+            for id, num in st.session_state.session_id_to_num_map.items(): 
+                if num == session: 
+                    st.session_state.session_id = id 
 
 
     # --------------------------------------------------------------------------
@@ -536,12 +574,12 @@ class StreamlitGUI:
         session_state['log_stream'].seek(0, 2) 
 
 
-    def save_log_to_dropbox(self, session_state:Dict, log_stream:BytesIO) -> None: 
+    def save_log_to_dropbox(self, session_state:Dict, log_stream:io.BytesIO) -> None: 
         save_fpath = Path(self.dropbox_path)/session_state['username']/f"log+{session_state['username']}+{session_state['session_id']}.log"
 
         content = log_stream.getvalue().encode("utf-8") 
 
-        self.save_to_dropbox(BytesIO(content), str(save_fpath))
+        self.save_to_dropbox(io.BytesIO(content), str(save_fpath))
 
 
     def save_transcript_to_dropbox(self, session_state:Dict) -> None: 
@@ -559,20 +597,20 @@ class StreamlitGUI:
 
         # save the transcript history 
         df = pd.DataFrame(session_state['transcript_history'])
-        csv_content = BytesIO() 
+        csv_content = io.BytesIO() 
         df.to_csv(csv_content, index=False, encoding='utf-8')
         csv_content.seek(0)
         self.save_to_dropbox(csv_content, str(save_fpath))
 
 
-    def save_summary_to_dropbox(self, session_state:Dict, doc_content:BytesIO) -> None: 
+    def save_summary_to_dropbox(self, session_state:Dict, doc_content:io.BytesIO) -> None: 
         """Saves the summary docx to dropbox 
 
         Usually runs in a separate thread to not interrupt the main chatbot experience 
 
         Args:
             session_state (Dict): the current session state dict to reference inside the thread 
-            doc_content (BytesIO): the docx data to save 
+            doc_content (io.BytesIO): the docx data to save 
         """
         # create the path to save to 
         save_fpath = Path(self.dropbox_path)/session_state['username']/f"summary_document+{session_state['username']}+{session_state['session_id']}+{int(datetime.now(timezone.utc).timestamp())}.docx"
@@ -583,13 +621,13 @@ class StreamlitGUI:
         self.save_to_dropbox(doc_content, str(save_fpath))
 
 
-    def save_to_dropbox(self, content:BytesIO, save_fpath:str) -> None: 
+    def save_to_dropbox(self, content:io.BytesIO, save_fpath:str) -> None: 
         """Saves some content to dropbox 
 
         Usually runs in a separate thread to not interrupt the main chatbot experience 
 
         Args:
-            content (BytesIO): the content to save
+            content (io.BytesIO): the content to save
             save_fpath (str): the path to save to 
         """
         # create the dropbox client 
@@ -633,3 +671,33 @@ class StreamlitGUI:
             if c.lower() in msg.lower() or m.lower() in msg.lower(): 
                 return True, m 
         return False, msg 
+    
+
+    def get_past_sessions(self) -> None: 
+        # create the dropbox client 
+        dbx = dropbox.Dropbox(oauth2_refresh_token=st.secrets['REFRESH_TOKEN_DROPBOX'], app_key=st.secrets['APP_KEY_DROPBOX'], app_secret=st.secrets['APP_SECRET_DROPBOX']) 
+
+        transcripts_fpath = Path(self.dropbox_path)/st.session_state['username']
+        past_transcripts = dbx.files_search_v2(
+            query="transcript*.csv", 
+            options=dropbox.files.SearchOptions(
+                path=str(transcripts_fpath), 
+                order_by=dropbox.files.SearchOrderBy.last_modified_time
+            )
+        )
+        past_transcripts_map = {'New Session': {'gui_message_history': [], 'transcript_history': []}}
+        session_id_to_num_map = {st.session_state.session_id: 'New Session'}
+        for i, transcript in enumerate(list(past_transcripts.matches)[::-1]): 
+            fname = transcript.metadata.get_metadata().name 
+            past_transcript_session_id = fname.replace('.csv', '').split('+')[-1] 
+            session_id_to_num_map[past_transcript_session_id] = f"Session {i+1}"
+            past_transcripts_map[f"Session {i+1}"] = {'gui_message_history': [], 'transcript_history': []}
+            _, response = dbx.files_download(str(transcripts_fpath/fname))
+            content = response.content.decode('utf-8') 
+
+            csv_reader = csv.DictReader(io.StringIO(content))
+            for row in csv_reader: 
+                past_transcripts_map[f"Session {i+1}"]['transcript_history'].append(row) 
+                past_transcripts_map[f"Session {i+1}"]['gui_message_history'].append({'role': row['role'], 'content': row['content']}) 
+        st.session_state.past_transcripts_map = past_transcripts_map 
+        st.session_state.session_id_to_num_map = session_id_to_num_map
